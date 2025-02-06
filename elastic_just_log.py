@@ -1,4 +1,5 @@
 import os
+import subprocess
 from elasticsearch import Elasticsearch
 
 # Подключение к БД
@@ -19,11 +20,13 @@ if not es.indices.exists(index=index_name):
     es.indices.create(index=index_name)
     print(f"✅ Индекс '{index_name}' создан.")
 
-# Поиск с использованием scroll
+# Поиск с использованием scroll и фильтрацией по 'TargetUserName'
 query = {
     "size": scroll_size,
     "query": {
-        "match_all": {}
+        "match": {
+            "TargetUserName": "sa"  # Фильтруем только по пользователю 'sa'
+        }
     }
 }
 
@@ -38,7 +41,7 @@ try:
 
         scroll_id = response["_scroll_id"]
         total_hits = response["hits"]["total"]["value"]
-        print(f"🔍 Найдено {total_hits} записей, начинаю экспорт...")
+        print(f"🔍 Найдено {total_hits} записей с TargetUserName='sa', начинаю экспорт...")
 
         while len(response["hits"]["hits"]) > 0:
             for hit in response["hits"]["hits"]:
@@ -48,6 +51,12 @@ try:
             scroll_id = response["_scroll_id"]
 
         print(f"✅ Логи записаны в файл {output_file}")
+
+        # Открываем файл автоматически
+        if os.name == "nt":  # Windows
+            os.system(f'start {output_file}')
+        else:  # Linux/macOS
+            subprocess.run(["xdg-open", output_file])
 
 except IOError as e:
     print(f"❌ Ошибка при работе с файлом {output_file}: {e}")

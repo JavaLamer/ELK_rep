@@ -1,0 +1,46 @@
+from elasticsearch import Elasticsearch
+
+# Подключение к БД
+ELASTIC_HOST = "http://localhost:9200"
+ELASTIC_USER = "elastic"
+ELASTIC_PASSWORD = "your_password"
+
+es = Elasticsearch(ELASTIC_HOST, basic_auth=(ELASTIC_USER, ELASTIC_PASSWORD))
+
+index_name = "your_index_name"
+
+# Начальный запрос с использованием scroll
+response = es.search(
+    index=index_name,
+    scroll="2m",  # Время жизни scroll-контекста
+    size=1000,  # Количество документов за раз
+    body={
+        "_source": ["host.name", "winlogon.event_data.SubjectUserName"],
+        "query": {"term": {"winlogon.event_data.SubjectUserName": "sa"}}
+    }
+)
+
+scroll_id = response["_scroll_id"]
+total_hits = response["hits"]["total"]["value"]
+print(f"Всего найдено документов: {total_hits}")
+
+all_hosts = set()
+
+# Получаем данные порциями
+while response["hits"]["hits"]:
+    for hit in response["hits"]["hits"]:
+        host_name = hit["_source"].get("host", {}).get("name")
+        if host_name:
+            all_hosts.add(host_name)
+
+    # Делаем следующий запрос
+    response = es.scroll(scroll_id=scroll_id, scroll="2m")
+
+# Завершаем scroll-сессию
+es.clear_scroll(scroll_id=scroll_id)
+
+# Записываем уникальные хосты в файл
+with open("logs.txt", "w") as file:
+    file.writelines(f"{host}\n" for host in all_hosts)
+
+print(f"✅ Собрано {len(all_hosts)} уникальных хостов")

@@ -19,11 +19,12 @@ if not es.indices.exists(index=index_name):
     print(f"✅ Индекс '{index_name}' создан.")
 
 # Получаем данные из Elasticsearch
-response = es.search(index=index_name, body={
+response = es.search(body={
     "_source": ["host.name", "winlogon.event_data.SubjectUserName"],
     "query": {
         "term": {"winlogon.event_data.SubjectUserName": "sa"}
     },
+    "from" : 0
     "size": 50
 })
 

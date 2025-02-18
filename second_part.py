@@ -1,48 +1,120 @@
-import pandas as pd
 from elasticsearch import Elasticsearch
-import json
+from elasticsearch.exceptions import RequestError, ConnectionError, TransportError
+from datetime import datetime
+import os
+import pandas as pd
+from openpyxl import load_workbook, Workbook
 
-# Подключение к Elasticsearch
-es = Elasticsearch("http://localhost:9200")  # Укажи свой адрес
+# Константы конфигурации
+ELASTIC_HOST = "http://172.10.12.31:9200"
+ELASTIC_USER = "root"
+ELASTIC_PASSWORD = "uzZS6e2rhf56"
+BASE_DIR = "D:\\code\\dir"
+INDEXES_FILE = "indexes.txt"
+EXCEL_FILE = os.path.join(BASE_DIR, "Sa_host_message_file.xlsx")
 
-# Путь к файлу с пользователями и индексами
-USER_LOGS_FILE = "user_logs.csv"  # В случае CSV
-OUTPUT_FILE = "user_data.xlsx"  # Выходной Excel файл
+# Инициализируем клиент Elasticsearch
+es = Elasticsearch(ELASTIC_HOST, basic_auth=(ELASTIC_USER, ELASTIC_PASSWORD))
 
-# Читаем файл CSV
-df = pd.read_csv(USER_LOGS_FILE)
+# Создаем рабочую директорию, если она не существует
+os.makedirs(BASE_DIR, exist_ok=True)
 
-# Список для итоговых данных
-output_data = []
+def load_processed_indices():
+    """Загружает список обработанных индексов из файла."""
+    if os.path.exists(INDEXES_FILE):
+        with open(INDEXES_FILE, 'r', encoding='utf-8') as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
 
-# Проходим по всем строкам в DataFrame
-for _, row in df.iterrows():
-    user = row['user']
-    indexes = json.loads(row['index'])  # Переводим строку JSON в словарь
-    for index, count in indexes.items():
-        # Делаем запрос для каждого индекса
-        query = {
-            "query": {
-                "term": {"user.keyword": user}  # Поиск по имени пользователя
-            },
-            "_source": ["user", "host_name", "message"]  # Нам нужны только эти поля
-        }
+def save_processed_index(index_name):
+    """Сохраняет обработанный индекс в файл."""
+    with open(INDEXES_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"{index_name}\n")
+
+def initialize_excel():
+    """Создает Excel-файл, если он не существует."""
+    if not os.path.exists(EXCEL_FILE):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Data"
+        ws.append(['Хост', 'Пользователь', 'Индекс', 'Короткое сообщение', 'Сообщение'])
+        wb.save(EXCEL_FILE)
+
+def append_to_excel(data_list):
+    """Добавляет данные в Excel-файл, избегая дубликатов short_message для одного host_name."""
+    try:
+        wb = load_workbook(EXCEL_FILE)
+        ws = wb.active
+        existing_data = set()
         
-        # Получаем результаты запроса
-        response = es.search(index=index, body=query, size=count)
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            existing_data.add((row[0], row[3]))  # (host_name, short_message)
         
-        # Обрабатываем каждый результат
-        for hit in response['hits']['hits']:
-            # Извлекаем данные
-            username = hit['_source'].get('user')
-            host_name = hit['_source'].get('host_name', 'Unknown')  # Если нет host_name, ставим "Unknown"
-            message = hit['_source'].get('message', 'No message')
-            
-            # Добавляем результат в итоговый список
-            output_data.append([username, host_name, message, index])
+        new_data = [row for row in data_list if (row[0], row[3]) not in existing_data]
+        
+        for row in new_data:
+            ws.append(row)
+        
+        wb.save(EXCEL_FILE)
+        wb.close()
+        print(f"[{datetime.now()}] Данные успешно добавлены в {EXCEL_FILE}")
+    except Exception as e:
+        print(f"[{datetime.now()}] Ошибка при записи в Excel: {str(e)}")
 
-# Записываем итоговые данные в Excel
-df_output = pd.DataFrame(output_data, columns=["username", "host_name", "message", "index"])
-df_output.to_excel(OUTPUT_FILE, index=False)
+def process_indices():
+    """Обрабатывает новые индексы в Elasticsearch."""
+    try:
+        indices_response = es.cat.indices(h='index', s='index')
+        all_indices = set(indices_response.split())
+        processed_indices = load_processed_indices()
+        new_indices = sorted(all_indices - processed_indices)
 
-print(f"Данные успешно сохранены в {OUTPUT_FILE}")
+        if not new_indices:
+            print(f"[{datetime.now()}] Нет новых индексов для обработки.")
+            return
+
+        for index_name in new_indices:
+            try:
+                query = {
+                    "size": 10000,
+                    "_source": ["message", "host.name", "winlog.event_data.SubjectUserName"],
+                    "query": {
+                        "bool": {
+                            "must": [{"match": {"winlog.event_data.SubjectUserName": "sa"}}]
+                        }
+                    }
+                }
+                response = es.search(index=index_name, body=query, scroll='5m')
+                scroll_id = response['_scroll_id']
+                buffer_data = []
+                print(f"[{datetime.now()}] Обрабатывается индекс: {index_name}")
+
+                while response['hits']['hits']:
+                    for hit in response['hits']['hits']:
+                        source = hit.get('_source', {})
+                        host_name = source.get('host', {}).get('name', 'Неизвестно')
+                        message = source.get('message', '')
+                        username = source.get('winlog', {}).get('event_data', {}).get('SubjectUserName', 'Неизвестно')
+                        short_message = message.split('.')[0].strip() if '.' in message else message
+
+                        buffer_data.append([host_name, username, index_name, short_message, message])
+                    
+                    response = es.scroll(scroll_id=scroll_id, scroll='5m')
+                
+                if buffer_data:
+                    append_to_excel(buffer_data)
+
+                save_processed_index(index_name)
+                print(f"[{datetime.now()}] Индекс {index_name} обработан.")
+
+            except (TransportError, RequestError, ConnectionError) as e:
+                print(f"[{datetime.now()}] Ошибка при обработке {index_name}: {str(e)}")
+            except Exception as e:
+                print(f"[{datetime.now()}] Непредвиденная ошибка в индексе {index_name}: {str(e)}")
+    
+    except Exception as e:
+        print(f"[{datetime.now()}] Критическая ошибка при получении индексов: {str(e)}")
+
+if __name__ == "__main__":
+    initialize_excel()
+    process_indices()

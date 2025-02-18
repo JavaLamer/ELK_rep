@@ -1,65 +1,116 @@
-import pandas as pd
 from elasticsearch import Elasticsearch
-import json
+from elasticsearch.exceptions import RequestError, ConnectionError, TransportError
+from datetime import datetime
+import os
+import pandas as pd
+from openpyxl import load_workbook, Workbook
 
-# Подключение к Elasticsearch
-es = Elasticsearch("http://localhost:9200")  # Укажи свой адрес
+# Константы конфигурации
+ELASTIC_HOST = "http://172.10.12.31:9200"
+ELASTIC_USER = "root"
+ELASTIC_PASSWORD = "uzZS6e2rhf56"
+BASE_DIR = "D:\\code\\dir"
+INDEXES_FILE = "indexes.txt"
+EXCEL_FILE = os.path.join(BASE_DIR, "Sa_host_message_file.xlsx")
+CSV_FILE = os.path.join(BASE_DIR, "Sa_host_message_file.csv")
+BATCH_SIZE = 50000  # Размер пакета для записи
 
-# Путь к файлам
-HOST_USER_FILE = "host_user.txt"  # Файл с хостами и пользователями
-USER_LOGS_FILE = "user_logs.txt"  # Файл с данными о пользователях и индексах
-OUTPUT_FILE = "user_data.xlsx"  # Выходной Excel файл
+# Инициализируем клиент Elasticsearch
+es = Elasticsearch(ELASTIC_HOST, basic_auth=(ELASTIC_USER, ELASTIC_PASSWORD))
 
-# Читаем файл с пользователями и индексами
-user_logs = {}
-with open(USER_LOGS_FILE, "r") as f:
-    for line in f:
-        user, data = line.strip().split(":", 1)
-        user_logs[user] = json.loads(data)
+# Создаем рабочую директорию, если она не существует
+os.makedirs(BASE_DIR, exist_ok=True)
 
-# Читаем файл с хостами и пользователями
-host_user_map = {}
-with open(HOST_USER_FILE, "r") as f:
-    for line in f:
-        parts = line.strip().split(" ")
-        host = parts[1]  # Второй элемент — это хост (например, rrb.com)
-        user = parts[3]  # Четвертый элемент — это user (например, rootsu)
-        host_user_map[host] = user
+def load_processed_indices():
+    """Загружает список обработанных индексов из файла."""
+    if os.path.exists(INDEXES_FILE):
+        with open(INDEXES_FILE, 'r', encoding='utf-8') as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
 
-# Список для итоговых данных
-output_data = []
+def save_processed_index(index_name):
+    """Сохраняет обработанный индекс в файл."""
+    with open(INDEXES_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"{index_name}\n")
 
-# Проходим по каждому хосту и ищем данные в user_logs.txt
-for host, user in host_user_map.items():
-    if user in user_logs:
-        # Получаем индексы для этого пользователя
-        indexes = user_logs[user]
+def load_existing_messages():
+    """Загружает существующие (host_name, short_message) в set() для ускорения проверки дубликатов."""
+    existing_data = set()
+    if os.path.exists(CSV_FILE):
+        try:
+            df = pd.read_csv(CSV_FILE, usecols=['Хост', 'Короткое сообщение'])
+            existing_data = set(zip(df['Хост'], df['Короткое сообщение']))
+        except Exception as e:
+            print(f"Ошибка загрузки CSV: {str(e)}")
+    return existing_data
+
+def append_to_csv(data_list):
+    """Записывает данные в CSV партиями."""
+    df = pd.DataFrame(data_list, columns=['Хост', 'Пользователь', 'Индекс', 'Короткое сообщение', 'Сообщение'])
+    df.to_csv(CSV_FILE, mode='a', header=not os.path.exists(CSV_FILE), index=False, encoding='utf-8')
+    print(f"[{datetime.now()}] Данные записаны в CSV")
+
+def process_indices():
+    """Обрабатывает новые индексы в Elasticsearch."""
+    try:
+        indices_response = es.cat.indices(h='index', s='index')
+        all_indices = set(indices_response.split())
+        processed_indices = load_processed_indices()
+        new_indices = sorted(all_indices - processed_indices)
         
-        # Для каждого индекса выполняем запрос
-        for index, count in indexes.items():
-            # Формируем запрос в Elasticsearch
-            query = {
-                "query": {
-                    "term": {"user.keyword": user}  # Поиск по имени пользователя
-                },
-                "_source": ["user", "host_name", "message"]  # Нам нужны только эти поля
-            }
-            
-            # Получаем результаты запроса
-            response = es.search(index=index, body=query, size=count)
-            
-            # Обрабатываем каждый результат
-            for hit in response['hits']['hits']:
-                # Извлекаем данные
-                username = hit['_source'].get('user')
-                host_name = hit['_source'].get('host_name', 'Unknown')  # Если нет host_name, ставим "Unknown"
-                message = hit['_source'].get('message', 'No message')
+        if not new_indices:
+            print(f"[{datetime.now()}] Нет новых индексов для обработки.")
+            return
+        
+        existing_messages = load_existing_messages()
+        
+        for index_name in new_indices:
+            try:
+                query = {
+                    "size": 10000,
+                    "_source": ["message", "host.name", "winlog.event_data.SubjectUserName"],
+                    "query": {
+                        "bool": {
+                            "must": [{"match": {"winlog.event_data.SubjectUserName": "sa"}}]
+                        }
+                    }
+                }
+                response = es.search(index=index_name, body=query, scroll='5m')
+                scroll_id = response['_scroll_id']
+                buffer_data = []
+                print(f"[{datetime.now()}] Обрабатывается индекс: {index_name}")
+
+                while response['hits']['hits']:
+                    for hit in response['hits']['hits']:
+                        source = hit.get('_source', {})
+                        host_name = source.get('host', {}).get('name', 'Неизвестно')
+                        message = source.get('message', '')
+                        username = source.get('winlog', {}).get('event_data', {}).get('SubjectUserName', 'Неизвестно')
+                        short_message = message.split('.')[0].strip() if '.' in message else message
+
+                        if (host_name, short_message) not in existing_messages:
+                            buffer_data.append([host_name, username, index_name, short_message, message])
+                            existing_messages.add((host_name, short_message))  # Добавляем в кэш
+
+                        if len(buffer_data) >= BATCH_SIZE:
+                            append_to_csv(buffer_data)
+                            buffer_data.clear()
+                    
+                    response = es.scroll(scroll_id=scroll_id, scroll='5m')
                 
-                # Добавляем результат в итоговый список
-                output_data.append([username, host_name, message, index])
+                if buffer_data:
+                    append_to_csv(buffer_data)
+                
+                save_processed_index(index_name)
+                print(f"[{datetime.now()}] Индекс {index_name} обработан.")
+            
+            except (TransportError, RequestError, ConnectionError) as e:
+                print(f"[{datetime.now()}] Ошибка при обработке {index_name}: {str(e)}")
+            except Exception as e:
+                print(f"[{datetime.now()}] Непредвиденная ошибка в индексе {index_name}: {str(e)}")
+    
+    except Exception as e:
+        print(f"[{datetime.now()}] Критическая ошибка при получении индексов: {str(e)}")
 
-# Записываем итоговые данные в Excel
-df_output = pd.DataFrame(output_data, columns=["username", "host_name", "message", "index"])
-df_output.to_excel(OUTPUT_FILE, index=False)
-
-print(f"Данные успешно сохранены в {OUTPUT_FILE}")
+if __name__ == "__main__":
+    process_indices()

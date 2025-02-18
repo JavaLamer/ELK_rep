@@ -1,112 +1,202 @@
 from elasticsearch import Elasticsearch
-from elasticsearch.exceptions import RequestError, ConnectionError, TransportError
+from elasticsearch.exceptions import RequestError, ConnectionError, TransportError, ApiError
 from datetime import datetime
 import os
 import pandas as pd
+import time
 from openpyxl import load_workbook, Workbook
+from pathlib import Path
 
-# Константы конфигурации
+
+
 ELASTIC_HOST = "http://172.10.12.31:9200"
 ELASTIC_USER = "root"
 ELASTIC_PASSWORD = "uzZS6e2rhf56"
+
 BASE_DIR = "D:\\code\\dir"
-INDEXES_FILE = "indexes.txt"
-EXCEL_FILE = os.path.join(BASE_DIR, "Sa_host_message_file.xlsx")
-
-# Инициализируем клиент Elasticsearch
-es = Elasticsearch(ELASTIC_HOST, basic_auth=(ELASTIC_USER, ELASTIC_PASSWORD))
-
-# Создаем рабочую директорию, если она не существует
 os.makedirs(BASE_DIR, exist_ok=True)
 
-def load_processed_indices():
-    """Загружает список обработанных индексов из файла."""
-    if os.path.exists(INDEXES_FILE):
-        with open(INDEXES_FILE, 'r', encoding='utf-8') as f:
-            return set(line.strip() for line in f if line.strip())
-    return set()
+es = Elasticsearch(ELASTIC_HOST, basic_auth=(ELASTIC_USER, ELASTIC_PASSWORD))
+size=5000
 
-def save_processed_index(index_name):
-    """Сохраняет обработанный индекс в файл."""
-    with open(INDEXES_FILE, 'a', encoding='utf-8') as f:
-        f.write(f"{index_name}\n")
+def get_hostname():
+    host_name = "ERIPAVC2022.rrb.by"
 
-def initialize_excel():
-    """Создает Excel-файл, если он не существует."""
-    if not os.path.exists(EXCEL_FILE):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Data"
-        ws.append(['Хост', 'Пользователь', 'Индекс', 'Короткое сообщение', 'Сообщение'])
-        wb.save(EXCEL_FILE)
+    return host_name
 
-def append_to_excel(data_list):
-    """Добавляет данные в Excel-файл."""
-    try:
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb.active
-        for row in data_list:
-            ws.append(row)
-        wb.save(EXCEL_FILE)
-        wb.close()
-        print(f"[{datetime.now()}] Данные успешно добавлены в {EXCEL_FILE}")
-    except Exception as e:
-        print(f"[{datetime.now()}] Ошибка при записи в Excel: {str(e)}")
 
-def process_indices():
-    """Обрабатывает новые индексы в Elasticsearch."""
-    try:
-        indices_response = es.cat.indices(h='index', s='index')
-        all_indices = set(indices_response.split())
-        processed_indices = load_processed_indices()
-        new_indices = sorted(all_indices - processed_indices)
-
-        if not new_indices:
-            print(f"[{datetime.now()}] Нет новых индексов для обработки.")
-            return
-
-        for index_name in new_indices:
-            try:
-                query = {
-                    "size": 10000,
-                    "_source": ["message", "host.name", "winlog.event_data.SubjectUserName"],
-                    "query": {
-                        "bool": {
-                            "must": [{"match": {"winlog.event_data.SubjectUserName": "sa"}}]
-                        }
-                    }
-                }
-                response = es.search(index=index_name, body=query, scroll='5m')
-                scroll_id = response['_scroll_id']
-                buffer_data = []
-                print(f"[{datetime.now()}] Обрабатывается индекс: {index_name}")
-
-                while response['hits']['hits']:
-                    for hit in response['hits']['hits']:
-                        source = hit.get('_source', {})
-                        host_name = source.get('host', {}).get('name', 'Неизвестно')
-                        message = source.get('message', '')
-                        username = source.get('winlog', {}).get('event_data', {}).get('SubjectUserName', 'Неизвестно')
-                        short_message = message.split('.')[0].strip() if '.' in message else message
-
-                        buffer_data.append([host_name, username, index_name, short_message, message])
-                    
-                    response = es.scroll(scroll_id=scroll_id, scroll='5m')
-                
-                if buffer_data:
-                    append_to_excel(buffer_data)
-
-                save_processed_index(index_name)
-                print(f"[{datetime.now()}] Индекс {index_name} обработан.")
-
-            except (TransportError, RequestError, ConnectionError) as e:
-                print(f"[{datetime.now()}] Ошибка при обработке {index_name}: {str(e)}")
-            except Exception as e:
-                print(f"[{datetime.now()}] Непредвиденная ошибка в индексе {index_name}: {str(e)}")
+def create_excel_template(filename, index):
+    full_path = os.path.join(BASE_DIR, filename)
     
+    if os.path.exists(full_path):
+        return
+    
+    try:
+        with pd.ExcelWriter(full_path, mode='w', engine='openpyxl') as writer:
+            df = pd.DataFrame(columns=[
+                'Хост',
+                'Пользователь',
+                'Индекс',
+                'Короткое сообщение',
+                'Сообщение'
+            ])
+            df.to_excel(writer, sheet_name=get_hostname(), index=False)
     except Exception as e:
-        print(f"[{datetime.now()}] Критическая ошибка при получении индексов: {str(e)}")
+        print(f"Ошибка при создании файла: {e}")
+      
+        
+def normalize_text(text):
+    return text.lower().strip()
 
-if __name__ == "__main__":
-    initialize_excel()
-    process_indices()
+
+def load_processed_indices(filename='indexes.txt'):
+    processed_indices = set()
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                processed_indices = {line.strip() for line in f if line.strip()}
+        except IOError as e:
+            print(f"Ошибка чтения файла {filename}: {str(e)}")
+    return processed_indices
+
+def save_processed_index(filename='indexes.txt', index_name=None):
+    try:
+        with open(filename, 'a', encoding='utf-8') as f:
+            f.write(f"{index_name}\n")
+    except IOError as e:
+        print(f"Ошибка записи в файл {filename}: {str(e)}")
+
+def append_to_excel(data_list, filename):
+    full_path = os.path.join(BASE_DIR, filename)
+    try:
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"Файл {full_path} не существует. Сначала создайте шаблон.")
+        
+        # Загружаем существующий файл
+        existing_wb = load_workbook(full_path)
+        sheet_name = get_hostname()
+        ws_source = existing_wb[sheet_name]
+        
+        # Добавляем новые данные напрямую в существующий файл
+        df = pd.DataFrame(data_list)
+        start_row = ws_source.max_row + 1
+        for idx, row in df.iterrows():
+            ws_source.append(list(row))
+        
+        # Сохраняем изменения
+        existing_wb.save(full_path)
+        print(f"Данные успешно добавлены в файл {full_path}")
+        return True
+        
+    except Exception as e:
+        print(f"Ошибка при добавлении данных: {str(e)}")
+        return False
+    finally:
+        # Закрываем рабочую книгу
+        if 'existing_wb' in locals():
+            existing_wb.close()
+
+
+def process_indices(es, host_name):
+    try:
+        if not es.ping():
+            raise ConnectionError("Нет соединения с Elasticsearch")
+            
+        body = {
+    "size": size,
+    "_source": ["message", "host.name", "winlog.event_data.SubjectUserName"],
+    "query": {
+        "bool": {
+            "must": [
+                { "match": { "winlog.event_data.SubjectUserName": "sa" }}
+                
+      ]
+    }
+  }
+}
+        
+        processed_indices = load_processed_indices()
+        unique_combinations = {}
+        excel_data_unique = []
+        excel_data_full = []
+        base_filename = f"{get_hostname()}_excel"
+        
+        indices_response = es.cat.indices(h='index', s='index')
+        
+        unique_filename = f"{base_filename}_unique.xlsx"
+       
+        
+        
+        for index_name in indices_response.split():
+            if index_name in processed_indices:
+                print(f"Пропуск индекса {index_name} (уже обработан)")
+                continue
+                
+            create_excel_template(unique_filename, index= index_name)
+               
+            
+            try:
+                response = es.search(
+                    index=index_name,
+                    body=body,
+                    scroll='1m'
+                )
+                
+
+                while True:
+                    for hit in response['hits']['hits']:
+                        try:
+                            host_name = hit['_source']['host']['name']
+                            message = hit['_source']['message']
+                            username = hit.get('_source', {}).get('winlog', {}).get('event_data', {}).get('SubjectUserName')
+                            
+                    
+                            
+                            first_sentence = message.split('.')[0].strip() if '.' in message else message
+                            combination_key = normalize_text(first_sentence)
+                            
+
+                            if combination_key not in unique_combinations:
+                                print(f"{first_sentence}\n{combination_key}\n\n")
+                                unique_combinations[combination_key] = True
+                                excel_data_unique.append({
+                                        'Хост': host_name,
+                                        'Пользователь': username,
+                                        'Индекс': index_name,
+                                        'Короткое сообщение': first_sentence,
+                                        'Сообщение': message
+                                        
+                                        
+                                })
+                                append_to_excel(excel_data_unique, unique_filename)
+                                print(f"* - {index_name}")
+
+                            
+                            
+                        except KeyError as e:
+                            print(f"Ошибка при обработке записи winlog в индексе {index_name}: {str(e)}")
+                            break  
+                            
+                    if len(response['hits']['hits']) == 0:
+                        print(f"Пустой - {index_name}")
+                        break
+                        
+                response = es.scroll(scroll_id=response['_scroll_id'], scroll='1m')
+                save_processed_index(index_name=index_name)
+                continue
+
+                    
+            except ApiError as e:
+                print(f"Ошибка при обработке индекса {index_name}: {str(e)}")
+                time.sleep(50)
+                pass
+                
+    except ConnectionError as e:
+        print(f"Ошибка подключения к Elasticsearch: {str(e)}")
+    except Exception as e:
+        print(f"Неожиданная ошибка: {str(e)}")
+
+# Запускаем обработку
+host_name = get_hostname()
+process_indices(es, host_name)
+

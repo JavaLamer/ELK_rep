@@ -2,20 +2,21 @@ from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import RequestError, ConnectionError, TransportError
 from datetime import datetime
 import os
+import time
 import pandas as pd
 from openpyxl import load_workbook, Workbook
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 
 # Константы конфигурации
 ELASTIC_HOST = "http://172.10.12.31:9200"
 ELASTIC_USER = "root"
 ELASTIC_PASSWORD = "uzZS6e2rhf56"
 BASE_DIR = "D:\\code\\dir"
-INDEXES_FILE = "indexes.txt"
-EXCEL_FILE = os.path.join(BASE_DIR, "Sa_host_message_file.xlsx")
-CSV_FILE = os.path.join(BASE_DIR, "Sa_host_message_file.csv")
+INDEXES_FILE = "indexesMT.txt"
+EXCEL_FILE = os.path.join(BASE_DIR, "Sa_host_message_file_MT.xlsx")
+CSV_FILE = os.path.join(BASE_DIR, "Sa_host_message_file_MT.csv")
 BATCH_SIZE = 50000  # Размер пакета для записи
-THREADS = 5  # Количество потоков для обработки индексов
+THREADS = 1  # Количество потоков для обработки индексов
 
 # Инициализируем клиент Elasticsearch
 es = Elasticsearch(ELASTIC_HOST, basic_auth=(ELASTIC_USER, ELASTIC_PASSWORD))
@@ -46,7 +47,7 @@ def load_existing_messages():
 def append_to_csv(data_list):
     df = pd.DataFrame(data_list, columns=['Хост', 'Пользователь', 'Индекс', 'Короткое сообщение', 'Сообщение'])
     df.to_csv(CSV_FILE, mode='a', header=not os.path.exists(CSV_FILE), index=False, encoding='utf-8')
-    print(f"[{datetime.now()}] Данные записаны в CSV")
+    
 
 def process_index(index_name, existing_messages):
     try:
@@ -62,8 +63,10 @@ def process_index(index_name, existing_messages):
         response = es.search(index=index_name, body=query, scroll='5m')
         scroll_id = response['_scroll_id']
         buffer_data = []
-        print(f"[{datetime.now()}] Обрабатывается индекс: {index_name}")
-
+        total_docs = response['hits']['total']['value']
+        processed_docs = 0
+        print(f"[{datetime.now()}] Обрабатывается индекс: {index_name} (всего документов: {total_docs})")
+        
         while response['hits']['hits']:
             for hit in response['hits']['hits']:
                 source = hit.get('_source', {})
@@ -71,25 +74,33 @@ def process_index(index_name, existing_messages):
                 message = source.get('message', '')
                 username = source.get('winlog', {}).get('event_data', {}).get('SubjectUserName', 'Неизвестно')
                 short_message = message.split('.')[0].strip() if '.' in message else message
-
                 if (host_name, short_message) not in existing_messages:
                     buffer_data.append([host_name, username, index_name, short_message, message])
                     existing_messages.add((host_name, short_message))
-
+                processed_docs += 1
+                
+                # Показываем прогресс каждые 10000 документов
+                if processed_docs % 100000 == 0:
+                    progress = (processed_docs / total_docs) * 100
+                    print(f"[{datetime.now()}] Индекс {index_name}: обработано {processed_docs} из {total_docs} ({progress:.1f}%)")
+                
                 if len(buffer_data) >= BATCH_SIZE:
                     append_to_csv(buffer_data)
                     buffer_data.clear()
-
+            
             response = es.scroll(scroll_id=scroll_id, scroll='5m')
-
+        
         if buffer_data:
             append_to_csv(buffer_data)
         
         save_processed_index(index_name)
-        print(f"[{datetime.now()}] Индекс {index_name} обработан.")
+        
+        
     except (TransportError, RequestError, ConnectionError) as e:
+        time.sleep(10)
         print(f"[{datetime.now()}] Ошибка при обработке {index_name}: {str(e)}")
     except Exception as e:
+        time.sleep(10)
         print(f"[{datetime.now()}] Непредвиденная ошибка в индексе {index_name}: {str(e)}")
 
 def process_indices():
@@ -105,11 +116,12 @@ def process_indices():
         
         existing_messages = load_existing_messages()
         
-        with ThreadPoolExecutor(max_workers=THREADS) as executor:
+        with ProcessPoolExecutor(max_workers=THREADS) as executor:
             futures = {executor.submit(process_index, index, existing_messages): index for index in new_indices}
             for future in as_completed(futures):
                 future.result()  # Обрабатываем исключения в потоках
     except Exception as e:
+        time.sleep(10)
         print(f"[{datetime.now()}] Критическая ошибка при получении индексов: {str(e)}")
 
 if __name__ == "__main__":
